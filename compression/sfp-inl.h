@@ -20,7 +20,6 @@
 #include <stddef.h>
 #include <stdint.h>
 
-// copybara:import_next_line:gemma_cpp
 #include "compression/sfp.h"
 #include "hwy/base.h"
 
@@ -34,6 +33,7 @@
 #define THIRD_PARTY_GEMMA_CPP_SFP_INL_TOGGLE
 #endif
 
+#include "hwy/detect_targets.h"
 #include "hwy/highway.h"
 
 HWY_BEFORE_NAMESPACE();
@@ -158,9 +158,68 @@ class SfpCodec {
     return hn::IfThenZeroElse(is_zero, encoded);
   }
 
+  // Decodes u8 `encoded` into `lo` and `hi` bytes of bf16. 3 ops (AVX-512).
+#if HWY_TARGET <= HWY_AVX3_DL || HWY_IDE
+  template <class D, HWY_IF_U8_D(D), HWY_IF_V_SIZE_D(D, 64)>
+  static HWY_INLINE void DecBytes(D d, hn::Vec<D> encoded, hn::Vec<D>& lo,
+                                  hn::Vec<D>& hi) {
+    const hn::Vec<D> k80 = hn::Set(d, 0x80u);
+    HWY_DASSERT(hn::AllTrue(d, hn::Ne(encoded, k80)));  // -0 is reserved
+
+    // Two 2x64 table lookups for lo/hi.
+    alignas(64) static constexpr uint8_t kTblL0[64] = {
+        0x00, 0x20, 0x40, 0x60, 0x80, 0xA0, 0xC0, 0xE0, 0x00, 0x20, 0x40,
+        0x60, 0x80, 0xA0, 0xC0, 0xE0, 0x00, 0x20, 0x40, 0x60, 0x80, 0xA0,
+        0xC0, 0xE0, 0x00, 0x20, 0x40, 0x60, 0x80, 0xA0, 0xC0, 0xE0, 0x00,
+        0x20, 0x40, 0x60, 0x80, 0xA0, 0xC0, 0xE0, 0x00, 0x20, 0x40, 0x60,
+        0x80, 0xA0, 0xC0, 0xE0, 0x00, 0x20, 0x40, 0x60, 0x80, 0xA0, 0xC0,
+        0xE0, 0x00, 0x20, 0x40, 0x60, 0x80, 0xA0, 0xC0, 0xE0};
+    alignas(64) static constexpr uint8_t kTblL1[64] = {
+        0x00, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0xA0,
+        0xB0, 0xC0, 0xD0, 0xE0, 0xF0, 0x00, 0x10, 0x20, 0x30, 0x40, 0x50,
+        0x60, 0x70, 0x80, 0x90, 0xA0, 0xB0, 0xC0, 0xD0, 0xE0, 0xF0, 0x00,
+        0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0xA0, 0xB0,
+        0xC0, 0xD0, 0xE0, 0xF0, 0x00, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60,
+        0x70, 0x80, 0x90, 0xA0, 0xB0, 0xC0, 0xD0, 0xE0, 0xF0};
+    alignas(64) static constexpr uint8_t kTblH0[64] = {
+        0x00, 0x34, 0x34, 0x34, 0x34, 0x34, 0x34, 0x34, 0x35, 0x35, 0x35,
+        0x35, 0x35, 0x35, 0x35, 0x35, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36,
+        0x36, 0x36, 0x37, 0x37, 0x37, 0x37, 0x37, 0x37, 0x37, 0x37, 0x38,
+        0x38, 0x38, 0x38, 0x38, 0x38, 0x38, 0x38, 0x39, 0x39, 0x39, 0x39,
+        0x39, 0x39, 0x39, 0x39, 0x3A, 0x3A, 0x3A, 0x3A, 0x3A, 0x3A, 0x3A,
+        0x3A, 0x3B, 0x3B, 0x3B, 0x3B, 0x3B, 0x3B, 0x3B, 0x3B};
+    alignas(64) static constexpr uint8_t kTblH1[64] = {
+        0x3C, 0x3C, 0x3C, 0x3C, 0x3C, 0x3C, 0x3C, 0x3C, 0x3C, 0x3C, 0x3C,
+        0x3C, 0x3C, 0x3C, 0x3C, 0x3C, 0x3D, 0x3D, 0x3D, 0x3D, 0x3D, 0x3D,
+        0x3D, 0x3D, 0x3D, 0x3D, 0x3D, 0x3D, 0x3D, 0x3D, 0x3D, 0x3D, 0x3E,
+        0x3E, 0x3E, 0x3E, 0x3E, 0x3E, 0x3E, 0x3E, 0x3E, 0x3E, 0x3E, 0x3E,
+        0x3E, 0x3E, 0x3E, 0x3E, 0x3F, 0x3F, 0x3F, 0x3F, 0x3F, 0x3F, 0x3F,
+        0x3F, 0x3F, 0x3F, 0x3F, 0x3F, 0x3F, 0x3F, 0x3F, 0x3F};
+    const hn::Vec<D> tblL0 = hn::LoadU(d, kTblL0);
+    const hn::Vec<D> tblL1 = hn::LoadU(d, kTblL1);
+    const hn::Vec<D> tblH0 = hn::LoadU(d, kTblH0);
+    const hn::Vec<D> tblH1 = hn::LoadU(d, kTblH1);
+#if HWY_IDE  // only let the IDE see portable code.
+    const auto idx = hn::IndicesFromVec(hn::AndNot(k80, encoded));
+#else  // AVX-512-specific: index MSB is ignored, no need to clear.
+    const hn::Indices512<uint8_t> idx{encoded.raw};
+#endif
+    hi = hn::TwoTablesLookupLanes(d, tblH0, tblH1, idx);
+    lo = hn::TwoTablesLookupLanes(d, tblL0, tblL1, idx);
+    hi = hn::OrAnd(hi, encoded, k80);  // Insert sign bit
+  }
+
+// Generic is only required for partial vectors (too small for tables).
+#undef SFP_IF_GENERIC_DEC
+#define SFP_IF_GENERIC_DEC(D) HWY_IF_V_SIZE_LE_D(D, 32)
+#else
+// Always enable the generic decoder.
+#undef SFP_IF_GENERIC_DEC
+#define SFP_IF_GENERIC_DEC(D) void* yes = nullptr
+#endif
+
   // Decodes u8 `encoded` into `lo` and `hi` bytes of bf16. 12 ops.
-  // Implementation detail, public because called by test.
-  template <class D, HWY_IF_U8_D(D)>
+  template <class D, HWY_IF_U8_D(D), SFP_IF_GENERIC_DEC(D)>
   static HWY_INLINE void DecBytes(D d, hn::Vec<D> encoded, hn::Vec<D>& lo,
                                   hn::Vec<D>& hi) {
     const hn::Vec<D> k0 = hn::Zero(d);
@@ -201,7 +260,8 @@ class SfpCodec {
     hi = hn::BitwiseIfThenElse(k80, sign_in_msb, hn::ShiftRight<1>(biased_e));
   }
 
-  // Encodes `num` bf16 values from `in_bf` to `out_packed`.
+  // Encodes `num` bf16 values from `in_bf` to `out_packed`. Their magnitude
+  // must be at most 1.875.
   template <class DBF, HWY_IF_BF16_D(DBF)>
   static HWY_INLINE void Enc(DBF dbf, const hwy::bfloat16_t* HWY_RESTRICT in_bf,
                              size_t num, SfpStream* HWY_RESTRICT out_packed) {
@@ -229,7 +289,8 @@ class SfpCodec {
     }
   }
 
-  // Encodes `num` f32 values from `in_f` to `packed`.
+  // Encodes `num` f32 values from `in_f` to `packed`. Their magnitude
+  // must be at most 1.875.
   template <class DF, HWY_IF_F32_D(DF)>
   static HWY_INLINE void Enc(DF df, const float* HWY_RESTRICT in_f, size_t num,
                              SfpStream* HWY_RESTRICT out_packed) {
@@ -419,6 +480,61 @@ class SfpCodec {
     }
   }
 
+  // Fused decode and dot product with even-odd bf16 into four f32 accumulators.
+  template <class DF, HWY_IF_F32_D(DF)>
+  static HWY_INLINE void DotEO(DF df, const SfpStream* HWY_RESTRICT in_packed,
+                               size_t num,
+                               const hwy::bfloat16_t* HWY_RESTRICT vec_aligned,
+                               hn::Vec<DF>& sum0, hn::Vec<DF>& sum1,
+                               hn::Vec<DF>& sum2, hn::Vec<DF>& sum3) {
+    const hn::Repartition<uint8_t, DF> d8;
+    const hn::Repartition<hwy::bfloat16_t, DF> dbf;
+    using V8 = hn::Vec<decltype(d8)>;
+    using VBF = hn::Vec<decltype(dbf)>;
+    const size_t N16 = hn::Lanes(dbf);
+    HWY_DASSERT(num % (2 * N16) == 0);  // whole SFP vector -> 2x bf16
+
+    HWY_UNROLL(1)
+    for (size_t i = 0; i < num; i += 2 * N16) {
+      const V8 packed = hn::LoadU(d8, &in_packed->byte + i);
+      const VBF ve = hn::LoadU(dbf, vec_aligned + i);
+      const VBF vo = hn::LoadU(dbf, vec_aligned + i + N16);
+      VBF be, bo;
+      DecEvenOdd(dbf, packed, be, bo);
+      sum0 = hn::ReorderWidenMulAccumulate(df, be, ve, sum0, sum1);
+      sum2 = hn::ReorderWidenMulAccumulate(df, bo, vo, sum2, sum3);
+    }
+  }
+
+  // Fused decode and dot product with even-odd f32 into four f32 accumulators.
+  template <class DF, HWY_IF_F32_D(DF)>
+  static HWY_INLINE void DotEO(DF df, const SfpStream* HWY_RESTRICT in_packed,
+                               size_t num,
+                               const float* HWY_RESTRICT vec_aligned,
+                               hn::Vec<DF>& sum0, hn::Vec<DF>& sum1,
+                               hn::Vec<DF>& sum2, hn::Vec<DF>& sum3) {
+    const hn::Repartition<uint8_t, DF> d8;
+    using V8 = hn::Vec<decltype(d8)>;
+    using VF = hn::Vec<decltype(df)>;
+    const size_t NF = hn::Lanes(df);
+    HWY_DASSERT(num % (4 * NF) == 0);  // whole SFP vector -> 4x f32
+
+    HWY_UNROLL(1)
+    for (size_t i = 0; i < num; i += 4 * NF) {
+      const V8 packed = hn::LoadU(d8, &in_packed->byte + i);
+      const VF ve0 = hn::LoadU(df, vec_aligned + i + NF * 0);
+      const VF vo0 = hn::LoadU(df, vec_aligned + i + NF * 1);
+      const VF ve1 = hn::LoadU(df, vec_aligned + i + NF * 2);
+      const VF vo1 = hn::LoadU(df, vec_aligned + i + NF * 3);
+      VF fe0, fo0, fe1, fo1;
+      DecEvenOddF(df, packed, fe0, fo0, fe1, fo1);
+      sum0 = hn::MulAdd(fe0, ve0, sum0);
+      sum1 = hn::MulAdd(fo0, vo0, sum1);
+      sum2 = hn::MulAdd(fe1, ve1, sum2);
+      sum3 = hn::MulAdd(fo1, vo1, sum3);
+    }
+  }
+
  private:
   // Wrappers to avoid code duplication across float/bf16 input types and
   // the main loop/remainder.
@@ -517,6 +633,33 @@ class SfpCodec {
     f1 = hn::PromoteUpperTo(df, bf0);
     f2 = hn::PromoteLowerTo(df, bf1);
     f3 = hn::PromoteUpperTo(df, bf1);
+  }
+
+  template <class DBF, HWY_IF_BF16_D(DBF),
+            class V8 = hn::Vec<hn::Repartition<uint8_t, DBF>>>
+  static HWY_INLINE void DecEvenOdd(DBF dbf, V8 packed, hn::Vec<DBF>& even,
+                                    hn::Vec<DBF>& odd) {
+    const hn::Repartition<uint8_t, DBF> d8;
+    V8 lo, hi;
+    DecBytes(d8, packed, lo, hi);
+    // (Supported since Highway 1.2)
+    even = hn::BitCast(dbf, hn::InterleaveEven(d8, lo, hi));
+    odd = hn::BitCast(dbf, hn::InterleaveOdd(d8, lo, hi));
+  }
+
+  template <class DF, HWY_IF_F32_D(DF),
+            class V8 = hn::Vec<hn::Repartition<uint8_t, DF>>>
+  static HWY_INLINE void DecEvenOddF(DF df, V8 packed, hn::Vec<DF>& even0,
+                                     hn::Vec<DF>& odd0, hn::Vec<DF>& even1,
+                                     hn::Vec<DF>& odd1) {
+    const hn::Repartition<hwy::bfloat16_t, DF> dbf;
+    using VBF = hn::Vec<decltype(dbf)>;
+    VBF even_bf, odd_bf;
+    DecEvenOdd(dbf, packed, even_bf, odd_bf);
+    even0 = hn::PromoteLowerTo(df, even_bf);
+    odd0 = hn::PromoteLowerTo(df, odd_bf);
+    even1 = hn::PromoteUpperTo(df, even_bf);
+    odd1 = hn::PromoteUpperTo(df, odd_bf);
   }
 };  // SfpCodec
 

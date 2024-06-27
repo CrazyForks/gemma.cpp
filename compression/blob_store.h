@@ -19,8 +19,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <memory>
 #include <vector>
 
+#include "compression/io.h"
 #include "hwy/aligned_allocator.h"
 #include "hwy/base.h"  // hwy::uint128_t
 #include "hwy/contrib/thread_pool/thread_pool.h"
@@ -59,10 +61,10 @@ struct BlobIO {
 class BlobReader {
  public:
   BlobReader() { requests_.reserve(500); }
-  ~BlobReader();
+  ~BlobReader() = default;
 
   // Opens `filename` and reads its header.
-  BlobError Open(const char* filename);
+  BlobError Open(const Path& filename);
 
   // Enqueues read requests if `key` is found and its size matches `size`.
   BlobError Enqueue(hwy::uint128_t key, void* data, size_t size);
@@ -73,22 +75,22 @@ class BlobReader {
  private:
   BlobStorePtr blob_store_;  // holds header, not the entire file
   std::vector<BlobIO> requests_;
-  int fd_ = 0;
+  std::unique_ptr<File> file_;
 };
 
 class BlobWriter {
  public:
-  void Add(hwy::uint128_t key, void* data, size_t size) {
+  void Add(hwy::uint128_t key, const void* data, size_t size) {
     keys_.push_back(key);
-    blobs_.emplace_back(static_cast<uint8_t*>(data), size);
+    blobs_.emplace_back(static_cast<const uint8_t*>(data), size);
   }
 
   // Stores all blobs to disk in the given order with padding for alignment.
-  BlobError WriteAll(hwy::ThreadPool& pool, const char* filename) const;
+  BlobError WriteAll(hwy::ThreadPool& pool, const Path& filename);
 
  private:
   std::vector<hwy::uint128_t> keys_;
-  std::vector<hwy::Span<uint8_t>> blobs_;
+  std::vector<hwy::Span<const uint8_t>> blobs_;
 };
 
 }  // namespace gcpp

@@ -22,12 +22,10 @@
 #include <stdio.h>
 
 #include <array>
+#include <cmath>  // lroundf, only if COMPRESS_STATS
 
-// copybara:import_next_line:gemma_cpp
 #include "compression/blob_store.h"
-// copybara:import_next_line:gemma_cpp
 #include "compression/compress.h"
-// copybara:import_next_line:gemma_cpp
 #include "compression/distortion.h"
 #include "hwy/aligned_allocator.h"
 #include "hwy/base.h"
@@ -44,9 +42,7 @@
 #define THIRD_PARTY_GEMMA_CPP_COMPRESS_TOGGLE
 #endif
 
-// copybara:import_next_line:gemma_cpp
 #include "compression/nuq-inl.h"
-// copybara:import_next_line:gemma_cpp
 #include "compression/sfp-inl.h"
 #include "hwy/contrib/dot/dot-inl.h"
 #include "hwy/highway.h"
@@ -60,9 +56,11 @@ namespace hn = hwy::HWY_NAMESPACE;
 template <typename T>  // primary, must specialize
 struct CompressTraits {};
 
+// Useful for backprop/, where weights are currently f32.
 template <>
 struct CompressTraits<float> {
   using MatT = float;
+  static constexpr bool kSupportsEvenOdd = false;  // unnecessary
 
   template <class DF, HWY_IF_F32_D(DF)>
   static HWY_INLINE void Compress(DF df, const float* HWY_RESTRICT in,
@@ -116,6 +114,7 @@ struct CompressTraits<float> {
 template <>
 struct CompressTraits<hwy::bfloat16_t> {
   using MatT = hwy::bfloat16_t;
+  static constexpr bool kSupportsEvenOdd = true;
 
   template <class DF, HWY_IF_F32_D(DF)>
   static HWY_INLINE void Compress(DF df, const float* HWY_RESTRICT in,
@@ -224,17 +223,65 @@ struct CompressTraits<hwy::bfloat16_t> {
     // bf16*bf16.
     return hn::Dot::Compute<kAssumptions>(d_vec, vec_aligned, in + in_ofs, num);
   }
+
+  // Computes the dot product of an even-odd deinterleaved, f32 `vec_aligned`
+  // and a column- major matrix `in`. `vec_aligned` should be aligned and
+  // alternate even-indexed `hn::Lanes(df32)` elements followed by odd-indexed
+  // `hn::Lanes(df32)` elements.
+  template <class DF, HWY_IF_F32_D(DF)>
+  static HWY_INLINE float DotEO(
+      const DF df32, const hwy::bfloat16_t* HWY_RESTRICT in, size_t in_ofs,
+      const float* HWY_RESTRICT vec_aligned, size_t num) {
+    HWY_DASSERT(num >= (hn::Lanes(df32) * 2) &&
+                (num % (hn::Lanes(df32) * 2)) == 0);
+    HWY_DASSERT((in_ofs % (hn::Lanes(df32) * 2)) == 0);
+    HWY_DASSERT(hn::IsAligned(df32, vec_aligned));
+
+    const hn::Repartition<hwy::bfloat16_t, DF> dbf16;
+    using VF32 = decltype(Zero(df32));
+    const size_t N = Lanes(dbf16);
+
+    VF32 sum0 = Zero(df32);
+    VF32 sum1 = Zero(df32);
+    VF32 sum2 = Zero(df32);
+    VF32 sum3 = Zero(df32);
+
+    for (size_t i = 0; i < num; /* i += 2 * N */) {
+      const auto interleaved0 = hn::LoadU(dbf16, in + in_ofs + i);
+      const VF32 ae0 = Load(df32, vec_aligned + i);
+      const VF32 ao0 = Load(df32, vec_aligned + i + (N / 2));
+      sum0 = hn::MulAdd(ae0, hn::PromoteEvenTo(df32, interleaved0), sum0);
+      sum1 = hn::MulAdd(ao0, hn::PromoteOddTo(df32, interleaved0), sum1);
+      i += N;
+
+      const auto interleaved1 = hn::LoadU(dbf16, in + in_ofs + i);
+      const VF32 ae1 = Load(df32, vec_aligned + i);
+      const VF32 ao1 = Load(df32, vec_aligned + i + (N / 2));
+      sum2 = hn::MulAdd(ae1, hn::PromoteEvenTo(df32, interleaved1), sum2);
+      sum3 = hn::MulAdd(ao1, hn::PromoteOddTo(df32, interleaved1), sum3);
+      i += N;
+    }
+
+    sum0 = hn::Add(sum0, sum1);
+    sum2 = hn::Add(sum2, sum3);
+    sum0 = hn::Add(sum0, sum2);
+    return hn::ReduceSum(df32, sum0);
+  }
 };
 
+// Switching floating point: 8-bit, 2..3 mantissa bits.
 template <>
 struct CompressTraits<SfpStream> {
   using MatT = SfpStream;
+  static constexpr bool kSupportsEvenOdd = true;
 
+  // Callers are responsible for scaling `in` such that its magnitudes do not
+  // exceed 1.875. See CompressedArray::scale().
   template <class DF, HWY_IF_F32_D(DF)>
-  static HWY_INLINE void Compress(DF df, const float* in, size_t num,
-                                  CompressPerThread& tls,
-                                  size_t /*out_capacity*/, MatT* out,
-                                  size_t out_ofs) {
+  static HWY_INLINE void Compress(DF df, const float* HWY_RESTRICT in,
+                                  size_t num, CompressPerThread& tls,
+                                  size_t /*out_capacity*/,
+                                  MatT* HWY_RESTRICT out, size_t out_ofs) {
     SfpCodec::Enc(df, in, num, out + out_ofs);
 
     if (COMPRESS_STATS) {
@@ -250,15 +297,21 @@ struct CompressTraits<SfpStream> {
   }
 
   template <class D, typename OutT>
-  static HWY_INLINE void Decompress(D d, size_t /*in_capacity*/, const MatT* in,
-                                    size_t in_ofs, OutT* out, size_t num) {
+  static HWY_INLINE void Decompress(D d, size_t /*in_capacity*/,
+                                    const MatT* HWY_RESTRICT in, size_t in_ofs,
+                                    OutT* HWY_RESTRICT out, size_t num) {
     SfpCodec::Dec(d, in + in_ofs, num, out);
   }
 
   template <class DF, typename VecT, HWY_IF_F32_D(DF)>
-  static HWY_INLINE float Dot(DF df, size_t /*in_capacity*/, const MatT* in,
-                              size_t in_ofs, const VecT* vec_aligned,
+  static HWY_INLINE float Dot(DF df, size_t /*in_capacity*/,
+                              const MatT* HWY_RESTRICT in, size_t in_ofs,
+                              const VecT* HWY_RESTRICT vec_aligned,
                               size_t num) {
+    HWY_DASSERT(num >= hn::Lanes(df) && (num % hn::Lanes(df)) == 0);
+    HWY_DASSERT((in_ofs % hn::Lanes(df)) == 0);
+    HWY_DASSERT(hn::IsAligned(df, vec_aligned));
+
     using VF = hn::Vec<decltype(df)>;
     VF sum0 = hn::Zero(df);
     VF sum1 = hn::Zero(df);
@@ -273,11 +326,41 @@ struct CompressTraits<SfpStream> {
     sum0 = hn::Add(sum0, sum2);
     return hn::ReduceSum(df, sum0);
   }
+
+  // Computes the dot product of an even-odd deinterleaved, f32 or bf16
+  // `vec_aligned` and a column-major matrix `in`. `vec_aligned` should be
+  // aligned and alternate even-indexed `hn::Lanes(df)` elements followed by
+  // odd-indexed `hn::Lanes(df)` elements.
+  template <class DF, typename VecT, HWY_IF_F32_D(DF)>
+  static HWY_INLINE float DotEO(const DF df, const MatT* HWY_RESTRICT in,
+                                size_t in_ofs,
+                                const VecT* HWY_RESTRICT vec_aligned,
+                                size_t num) {
+    HWY_DASSERT(num >= (hn::Lanes(df) * 2) && (num % (hn::Lanes(df) * 2)) == 0);
+    HWY_DASSERT((in_ofs % (hn::Lanes(df) * 2)) == 0);
+    HWY_DASSERT(hn::IsAligned(df, vec_aligned));
+
+    using VF = hn::Vec<decltype(df)>;
+    VF sum0 = hn::Zero(df);
+    VF sum1 = hn::Zero(df);
+    VF sum2 = hn::Zero(df);
+    VF sum3 = hn::Zero(df);
+
+    SfpCodec::DotEO(df, in + in_ofs, num, vec_aligned, sum0, sum1, sum2, sum3);
+
+    // Reduction tree: sum of all accumulators, then their lanes
+    sum0 = hn::Add(sum0, sum1);
+    sum2 = hn::Add(sum2, sum3);
+    sum0 = hn::Add(sum0, sum2);
+    return hn::ReduceSum(df, sum0);
+  }
 };
 
+// Nonuniform quantization, 4.5 bits per element, two separate streams.
 template <>
 struct CompressTraits<NuqStream> {
   using MatT = NuqStream;
+  static constexpr bool kSupportsEvenOdd = false;
 
   template <class DF, HWY_IF_F32_D(DF)>
   static HWY_INLINE void Compress(DF df, const float* in, size_t num,
@@ -407,9 +490,10 @@ HWY_INLINE void Decompress(const CompressedArray<MatT, kCapacity>& compressed,
         const hn::ScalableTag<OutT> d;
 
         const size_t ofs = idx_batch * kBatch;
-        const size_t num = idx_batch == num_batches - 1 ? (num - ofs) : kBatch;
+        const size_t batch =
+            idx_batch == num_batches - 1 ? (num - ofs) : kBatch;
         Traits::Decompress(d, compressed.size(), compressed.data(),
-                           compressed_ofs + ofs, out + ofs, num);
+                           compressed_ofs + ofs, out + ofs, batch);
       });
 
   const double t1 = hwy::platform::Now();
@@ -419,56 +503,68 @@ HWY_INLINE void Decompress(const CompressedArray<MatT, kCapacity>& compressed,
 }
 
 // Returns dot product with `vec_aligned` of length `num`.
-template <class DF, typename ArrayT, typename VecT>
-HWY_INLINE float Dot(DF df, const ArrayT& compressed, size_t compressed_ofs,
-                     const VecT* vec_aligned, size_t num) {
-  HWY_DASSERT(compressed_ofs + num <= compressed.size());
-  HWY_DASSERT(hn::IsAligned(df, vec_aligned));
-  using Traits = CompressTraits<typename ArrayT::value_type>;
-  return Traits::Dot(df, compressed.size(), compressed.data(), compressed_ofs,
-                     vec_aligned, num);
+template <bool kVecEO, class DF, size_t kCapacity, typename VecT>
+HWY_INLINE float Dot(DF df, const std::array<float, kCapacity>& w, size_t ofs,
+                     const VecT* x, size_t num) {
+  HWY_DASSERT(ofs + num <= kCapacity);
+  HWY_DASSERT(hn::IsAligned(df, x));
+  using Traits = CompressTraits<float>;
+  return Traits::Dot(df, w.size(), w.data(), ofs, x, num);
 }
 
 // Returns dot product with `vec_aligned` of length `num`.
-template <class DF, typename MatT, size_t kCapacity, typename VecT>
+template <bool kVecEO, class DF, typename MatT, size_t kCapacity, typename VecT>
 HWY_INLINE float Dot(DF df, const CompressedArray<MatT, kCapacity>& compressed,
                      size_t compressed_ofs, const VecT* vec_aligned,
                      size_t num) {
   HWY_DASSERT(compressed_ofs + num <= compressed.size());
   HWY_DASSERT(hn::IsAligned(df, vec_aligned));
   using Traits = CompressTraits<MatT>;
-  return (compressed.scale() * Traits::Dot(df, compressed.size(),
-                                           compressed.data(), compressed_ofs,
-                                           vec_aligned, num));
+  float dot_result;
+  if constexpr (kVecEO) {
+    dot_result = Traits::DotEO(df, compressed.data(), compressed_ofs,
+                               vec_aligned, num);
+  } else {
+    dot_result = Traits::Dot(df, compressed.size(), compressed.data(),
+                             compressed_ofs, vec_aligned, num);
+  }
+  return compressed.scale() * dot_result;
 }
 
-// Callback used by ForeachTensor.
+// Functor called for each tensor, which compresses and stores them along with
+// their scaling factors to BlobStore.
 class Compressor {
  public:
   explicit Compressor(hwy::ThreadPool& pool) : pool_(pool) {}
 
-  // Called for each tensor; compresses it and stores to the cache.
   template <typename MatT, size_t kCapacity>
   void operator()(const char* name, const float* weights,
                   CompressedArray<MatT, kCapacity>& compressed) {
-    fprintf(stderr, "Regenerating %s (%zuM), please wait\n", name,
-            kCapacity / (1000 * 1000));
-    Compress(weights, kCapacity, work_, kCapacity, compressed.data(), 0, pool_);
-    writer_.Add(CacheKey<MatT>(name), compressed.data(),
-                compressed.CompressedSize());
+    Insert(name, weights, kCapacity, work_, compressed.CompressedSize(),
+           compressed.data(), 0, pool_);
   }
 
-  void AddScales(float* scales, size_t len) {
+  template <typename MatT>
+  void Insert(const char* name, const float* weights, size_t weights_count,
+              CompressWorkingSet& work, size_t out_capacity, MatT* out,
+              size_t out_ofs, hwy::ThreadPool& pool) {
+    fprintf(stderr, "Regenerating %s (%zuM), please wait\n", name,
+            weights_count / (1000 * 1000));
+    Compress(weights, weights_count, work_, weights_count, out, 0, pool_);
+    writer_.Add(CacheKey<MatT>(name), out, out_capacity);
+  }
+
+  void AddScales(const float* scales, size_t len) {
     if (len) {
       writer_.Add(CacheKey<float>("scales"), scales, len * sizeof(scales[0]));
     }
   }
 
-  void WriteAll(hwy::ThreadPool& pool, const char* blob_filename) {
+  void WriteAll(hwy::ThreadPool& pool, const Path& blob_filename) {
     const BlobError err = writer_.WriteAll(pool, blob_filename);
     if (err != 0) {
-      fprintf(stderr, "Failed to write blobs to %s (error %d)\n", blob_filename,
-              err);
+      fprintf(stderr, "Failed to write blobs to %s (error %d)\n",
+              blob_filename.path.c_str(), err);
     }
   }
 

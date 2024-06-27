@@ -10,28 +10,41 @@ package(
     ],
 )
 
-cc_library(
-    name = "blob_store",
-    srcs = [
-        "blob_store.cc",
+config_setting(
+    name = "android",
+    constraint_values = [
+        "@platforms//os:android",
     ],
-    hdrs = [
-        "blob_store.h",
-    ],
-    deps = [
-        "@hwy//:hwy",
-        "@hwy//:thread_pool",
-    ],
+    visibility = [":__subpackages__"],
 )
 
-# Deprecated because it is also implemented in Highway; will be removed once
-# that Highway version is sufficiently widespread.
+FILE_DEPS = select({
+    "//conditions:default": [
+        # Placeholder for io deps, do not remove
+    ],
+    ":android": [],
+})
+
 cc_library(
-    name = "stats",
-    srcs = ["stats.cc"],
-    hdrs = ["stats.h"],
+    name = "io",
+    srcs = [
+        "io.cc",
+        # Placeholder for io backend, do not remove
+    ],
+    hdrs = ["io.h"],
     deps = [
         "@hwy//:hwy",
+    ] + FILE_DEPS,
+)
+
+cc_library(
+    name = "blob_store",
+    srcs = ["blob_store.cc"],
+    hdrs = ["blob_store.h"],
+    deps = [
+        ":io",
+        "@hwy//:hwy",
+        "@hwy//:thread_pool",
     ],
 )
 
@@ -40,6 +53,22 @@ cc_library(
     hdrs = ["distortion.h"],
     deps = [
         "@hwy//:hwy",
+        "@hwy//:stats",
+        "@hwy//hwy/contrib/sort:vqsort",
+    ],
+)
+
+cc_test(
+    name = "distortion_test",
+    size = "small",
+    srcs = ["distortion_test.cc"],
+    deps = [
+        ":distortion",
+        ":test_util",
+        "@googletest//:gtest_main",
+        "@hwy//:hwy",
+        "@hwy//:hwy_test_util",
+        "@hwy//:nanobenchmark",  # Unpredictable1
     ],
 )
 
@@ -48,20 +77,16 @@ cc_library(
     hdrs = ["test_util.h"],
     deps = [
         ":distortion",
-        ":stats",
         "@hwy//:hwy",
         "@hwy//:hwy_test_util",
+        "@hwy//:stats",
     ],
 )
 
 cc_library(
     name = "sfp",
-    hdrs = [
-        "sfp.h",
-    ],
-    textual_hdrs = [
-        "sfp-inl.h",
-    ],
+    hdrs = ["sfp.h"],
+    textual_hdrs = ["sfp-inl.h"],
     deps = [
         "@hwy//:hwy",
     ],
@@ -88,12 +113,8 @@ cc_test(
 
 cc_library(
     name = "nuq",
-    hdrs = [
-        "nuq.h",
-    ],
-    textual_hdrs = [
-        "nuq-inl.h",
-    ],
+    hdrs = ["nuq.h"],
+    textual_hdrs = ["nuq-inl.h"],
     deps = [
         ":sfp",
         "@hwy//:hwy",
@@ -134,11 +155,12 @@ cc_library(
     deps = [
         ":blob_store",
         ":distortion",
+        ":io",
         ":nuq",
         ":sfp",
-        ":stats",
         "@hwy//:dot",
         "@hwy//:hwy",
+        "@hwy//:stats",
         "@hwy//:thread_pool",
     ],
 )
@@ -146,16 +168,14 @@ cc_library(
 # For internal experimentation
 cc_library(
     name = "analyze",
-    textual_hdrs = [
-        "analyze.h",
-    ],
+    textual_hdrs = ["analyze.h"],
     deps = [
         ":distortion",
         ":nuq",
         ":sfp",
-        ":stats",
         "@hwy//:hwy",
         "@hwy//:nanobenchmark",  # timer
+        "@hwy//:stats",
         "@hwy//:thread_pool",
         "@hwy//hwy/contrib/sort:vqsort",
     ],

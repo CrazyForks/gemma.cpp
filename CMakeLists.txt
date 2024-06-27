@@ -22,7 +22,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-FetchContent_Declare(highway GIT_REPOSITORY https://github.com/google/highway.git GIT_TAG da250571a45826b21eebbddc1e50d0c1137dee5f EXCLUDE_FROM_ALL)
+FetchContent_Declare(highway GIT_REPOSITORY https://github.com/google/highway.git GIT_TAG 457c891775a7397bdb0376bb1031e6e027af1c48 EXCLUDE_FROM_ALL)
 FetchContent_MakeAvailable(highway)
 
 ## Note: absl needs to be installed by sentencepiece. This will only happen if
@@ -33,34 +33,53 @@ FetchContent_MakeAvailable(sentencepiece)
 FetchContent_Declare(json GIT_REPOSITORY https://github.com/nlohmann/json.git GIT_TAG 9cca280a4d0ccf0c08f47a99aa71d1b0e52f8d03 EXCLUDE_FROM_ALL)
 FetchContent_MakeAvailable(json)
 
+FetchContent_Declare(benchmark GIT_REPOSITORY https://github.com/google/benchmark.git GIT_TAG v1.8.2 EXCLUDE_FROM_ALL)
+FetchContent_MakeAvailable(benchmark)
+
 set(SOURCES
-  gemma.cc
   compression/blob_store.cc
   compression/blob_store.h
   compression/compress.h
   compression/compress-inl.h
+  compression/io_win.cc
+  compression/io.cc
+  compression/io.h
   compression/nuq.h
   compression/nuq-inl.h
   compression/sfp.h
   compression/sfp-inl.h
   compression/test_util.h
+  backprop/backward.cc
+  backprop/backward.h
+  backprop/backward-inl.h
+  backprop/backward_scalar.h
+  backprop/common_scalar.h
+  backprop/forward.cc
+  backprop/forward.h
+  backprop/forward-inl.h
+  backprop/forward_scalar.h
+  backprop/optimizer.cc
+  backprop/optimizer.h
+  gemma/configs.h
+  gemma/activations.h
+  gemma/benchmark_helper.cc
+  gemma/benchmark_helper.h
+  gemma/common.cc
+  gemma/common.h
+  gemma/cross_entropy.cc
+  gemma/cross_entropy.h
+  gemma/gemma.cc
+  gemma/gemma.h
+  gemma/ops.h
+  gemma/weights.cc
+  gemma/weights.h
+  gemma/weights_raw.h
   util/app.h
   util/args.h
   )
 
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE "Release")
-endif()
-
-# Allowable types for WEIGHT_TYPE:
-# float - slow, not recommended
-# hwy::bfloat16_t - bfloat16 as implemented by https://github.com/google/highway
-# SfpStream - 8-bit switched floating point (recommended)
-# NuqStream - experimental, work-in-progress
-option(WEIGHT_TYPE "Set weight type" "")
-
-if (WEIGHT_TYPE)
-  add_definitions(-DGEMMA_WEIGHT_T=${WEIGHT_TYPE})
 endif()
 
 FetchContent_GetProperties(sentencepiece)
@@ -72,26 +91,40 @@ set_property(TARGET libgemma PROPERTY CXX_STANDARD 17)
 set_target_properties(libgemma PROPERTIES PREFIX "")
 set_property(TARGET libgemma PROPERTY POSITION_INDEPENDENT_CODE ON)
 target_include_directories(libgemma PUBLIC ./)
-target_link_libraries(libgemma hwy hwy_contrib sentencepiece)
+target_link_libraries(libgemma hwy hwy_contrib sentencepiece-static)
 target_include_directories(libgemma PUBLIC ${sentencepiece_SOURCE_DIR})
 target_compile_definitions(libgemma PRIVATE $<$<PLATFORM_ID:Windows>:_CRT_SECURE_NO_WARNINGS NOMINMAX>)
 target_compile_options(libgemma PRIVATE $<$<PLATFORM_ID:Windows>:-Wno-deprecated-declarations>)
+install(TARGETS libgemma DESTINATION lib)
 
 # Executable Target
 
-add_executable(gemma run.cc)
+add_executable(gemma gemma/run.cc)
 target_link_libraries(gemma libgemma hwy hwy_contrib)
+install(TARGETS gemma DESTINATION bin)
 
-add_executable(benchmark benchmark.cc)
-target_link_libraries(benchmark libgemma hwy hwy_contrib nlohmann_json::nlohmann_json)
+add_executable(single_benchmark gemma/benchmark.cc)
+target_link_libraries(single_benchmark libgemma hwy hwy_contrib nlohmann_json::nlohmann_json)
+
+add_executable(benchmarks gemma/benchmarks.cc)
+target_link_libraries(benchmarks libgemma hwy hwy_contrib nlohmann_json::nlohmann_json benchmark)
+
+add_executable(debug_prompt debug_prompt.cc)
+target_link_libraries(debug_prompt libgemma hwy hwy_contrib nlohmann_json::nlohmann_json)
 
 ## Tests
 set(GEMMA_ENABLE_TESTS OFF CACHE BOOL "Enable Gemma tests")
 if (GEMMA_ENABLE_TESTS)
 
+enable_testing()
+include(GoogleTest)
+
 set(GEMMA_TEST_FILES
-  ops_test.cc
-  gemma_test.cc
+  backprop/backward_test.cc
+  backprop/backward_scalar_test.cc
+  backprop/optimize_test.cc
+  gemma/ops_test.cc
+  gemma/gemma_test.cc
 )
 
 foreach (TESTFILE IN LISTS GEMMA_TEST_FILES)
@@ -112,5 +145,5 @@ endif()  # GEMMA_ENABLE_TESTS
 
 ## Tools
 
-add_executable(compress_weights compress_weights.cc)
+add_executable(compress_weights gemma/compress_weights.cc)
 target_link_libraries(compress_weights libgemma hwy hwy_contrib)

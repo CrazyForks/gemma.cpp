@@ -18,7 +18,6 @@
 #define HWY_DISABLED_TARGETS HWY_SCALAR
 #endif
 
-// copybara:import_next_line:gemma_cpp
 #include "compression/sfp.h"
 
 #include <stddef.h>
@@ -27,6 +26,7 @@
 
 #include <set>
 
+#include "compression/test_util.h"
 #include "hwy/aligned_allocator.h"
 #include "hwy/base.h"
 #include "hwy/timer.h"
@@ -37,10 +37,7 @@
 // clang-format on
 #include "hwy/foreach_target.h"  // IWYU pragma: keep
 // Any highway.h must come after foreach_target.h
-// copybara:import_next_line:gemma_cpp
 #include "compression/sfp-inl.h"
-// copybara:import_next_line:gemma_cpp
-#include "compression/test_util.h"
 #include "hwy/highway.h"
 #include "hwy/tests/hwy_gtest.h"
 #include "hwy/tests/test_util-inl.h"
@@ -68,6 +65,26 @@ float F32FromSFP8(uint32_t sfp) {
   float result;
   hwy::CopySameSize(&binary32, &result);
   return result;
+}
+
+// Used for HWY_AVX3_DL and newer.
+void PrintTables() {
+  if (HWY_ONCE && false) {
+    uint8_t hi[128];
+    fprintf(stderr, "lo\n");
+    for (uint32_t sfp = 0; sfp < 128; ++sfp) {
+      const uint32_t u = hwy::BitCastScalar<uint32_t>(F32FromSFP8(sfp));
+      // Lower bits are zero, hence we can truncate instead of rounding to bf16.
+      HWY_ASSERT((u & 0xFFFF) == 0);
+      fprintf(stderr, "0x%02X,", (u >> 16) & 0xFF);
+      hi[sfp] = u >> 24;
+    }
+    fprintf(stderr, "\nhi\n");
+    for (uint32_t sfp = 0; sfp < 128; ++sfp) {
+      fprintf(stderr, "0x%02X,", hi[sfp]);
+    }
+    fprintf(stderr, "\n");
+  }
 }
 
 void TestAllUnique() {
@@ -307,10 +324,37 @@ struct TestEncDec {
         sum += hwy::ConvertScalarTo<double>(hwy::ScalarAbs(in[i]));
         stats.Notify(hwy::ConvertScalarTo<float>(in[i]), out);
       }
-      const double avg = sum / num;
-      fprintf(stderr, "Avg magnitude %.3E, p-norm %.3E snr %.2f @%zu = %.4E\n",
-              avg, stats.PNorm(), stats.GeomeanValueDivL1(), stats.MaxIndex(),
-              stats.MaxL1());
+      const double avg_in = sum / num;
+      const double snr = stats.GeomeanValueDivL1();
+      const double wl1 = stats.WeightedAverageL1();
+      if (false) {
+        fprintf(stderr,
+                "Num inputs %zu, avg %.3E, exact %zu round0 %zu (sum %E) snr "
+                "%.2f wL1 %f\n",
+                num, avg_in, stats.NumExact(), stats.NumRoundedToZero(),
+                stats.SumL1Rounded(), snr, wl1);
+      }
+      HWY_ASSERT(stats.Original().Count() == stats.L1().Count());
+      // Inputs are in [-1.875, 1.875], symmetric, and heavy-tailed.
+      HWY_ASSERT(stats.Original().Min() == -1.875f);
+      HWY_ASSERT(stats.Original().Max() == 1.875f);
+      HWY_ASSERT(gcpp::IsInside(-1E-6, 1E-6, stats.Original().Mean()));
+      HWY_ASSERT(gcpp::IsInside(-1E-6, 1E-6, stats.Original().Skewness()));
+      HWY_ASSERT(gcpp::IsInside(80.0, 100.0, stats.Original().Kurtosis()));
+      // Absolute errors are in [0, 0.0625], and (heavy) right-tailed.
+      HWY_ASSERT(stats.L1().Min() == 0.0f);
+      HWY_ASSERT(stats.L1().Max() == 0.0625f);
+      HWY_ASSERT(gcpp::IsInside(4E-4, 5E-4, stats.L1().Mean()));
+      HWY_ASSERT(gcpp::IsInside(10.0, 15.0, stats.L1().Skewness()));
+      HWY_ASSERT(gcpp::IsInside(150.0, 200.0, stats.L1().Kurtosis()));
+      // SNR is low because many *tiny* numbers are rounded to zero.
+      HWY_ASSERT_EQ(3322, stats.NumRoundedToZero());
+      HWY_ASSERT(gcpp::IsInside(5E-6, 6E-6, stats.SumL1Rounded()));
+      HWY_ASSERT(gcpp::IsInside(1.880, 1.885, stats.SumL1()));
+      HWY_ASSERT_EQ(256, stats.NumExact());
+      HWY_ASSERT_EQ(0, stats.NumSignFlip());
+      HWY_ASSERT(gcpp::IsInside(2.70, 2.75, snr));
+      HWY_ASSERT(gcpp::IsInside(0.010, 0.011, wl1));  // = half of mean |x|.
     }
   }
 };
@@ -357,15 +401,17 @@ struct TestDot {
   HWY_INLINE void operator()(T /*unused*/, D d) {
     const hn::Repartition<float, D> df;
     const size_t num = 1024;  // not too many for GeometricMean overflow.
+    const size_t N = hn::Lanes(d);
     auto in = hwy::AllocateAligned<T>(num);
     auto dec = hwy::AllocateAligned<T>(num);
     auto vec = hwy::AllocateAligned<T>(num);
+    auto vec_eo = hwy::AllocateAligned<T>(num);
     auto sfp = hwy::AllocateAligned<SfpStream>(num);
-    HWY_ASSERT(in && dec && vec && sfp);
+    HWY_ASSERT(in && dec && vec && vec_eo && sfp);
 
     // Generate inputs and verify their distribution.
     hwy::RandomState rng;
-    Stats in_stats;
+    hwy::Stats in_stats;
     for (size_t i = 0; i < num; ++i) {
       const float r = static_cast<float>(RandomGaussian(rng));
       in_stats.Notify(r);
@@ -378,33 +424,60 @@ struct TestDot {
     }
     VerifyGaussian(in_stats);
 
+    // Convert vec to even/odd for DotEO
+    for (size_t i = 0; i < num; i += 2 * N) {
+      hn::Vec<D> ve, vo;
+      hn::LoadInterleaved2(d, vec.get() + i, ve, vo);
+      hn::Store(ve, d, vec_eo.get() + i + 0);
+      hn::Store(vo, d, vec_eo.get() + i + N);
+    }
+
     SfpCodec::Enc(d, in.get(), num, sfp.get());
 
     // Compute dot product without decompression.
-    double actual = 0.0;
+    float actual = 0.0f;
+    float actual_eo = 0.0f;
     double elapsed = hwy::HighestValue<double>();
+    double elapsed_eo = hwy::HighestValue<double>();
     for (size_t rep = 0; rep < 200; ++rep) {
-      hn::Vec<decltype(df)> sum0 = hn::Zero(df);
-      hn::Vec<decltype(df)> sum1 = hn::Zero(df);
-      hn::Vec<decltype(df)> sum2 = hn::Zero(df);
-      hn::Vec<decltype(df)> sum3 = hn::Zero(df);
-      const double t0 = hwy::platform::Now();
-      SfpCodec::Dot(df, sfp.get(), num, vec.get(), sum0, sum1, sum2, sum3);
-      const double t1 = hwy::platform::Now();
-      elapsed = HWY_MIN(elapsed, t1 - t0);
-      sum0 = hn::Add(hn::Add(sum0, sum1), hn::Add(sum2, sum3));
-      actual = hn::ReduceSum(df, sum0);
+      {
+        hn::Vec<decltype(df)> sum0 = hn::Zero(df);
+        hn::Vec<decltype(df)> sum1 = hn::Zero(df);
+        hn::Vec<decltype(df)> sum2 = hn::Zero(df);
+        hn::Vec<decltype(df)> sum3 = hn::Zero(df);
+        const double t0 = hwy::platform::Now();
+        SfpCodec::Dot(df, sfp.get(), num, vec.get(), sum0, sum1, sum2, sum3);
+        const double t1 = hwy::platform::Now();
+        elapsed = HWY_MIN(elapsed, t1 - t0);
+        sum0 = hn::Add(hn::Add(sum0, sum1), hn::Add(sum2, sum3));
+        actual = hn::ReduceSum(df, sum0);
+      }
+      {
+        hn::Vec<decltype(df)> sum0 = hn::Zero(df);
+        hn::Vec<decltype(df)> sum1 = hn::Zero(df);
+        hn::Vec<decltype(df)> sum2 = hn::Zero(df);
+        hn::Vec<decltype(df)> sum3 = hn::Zero(df);
+        const double t0 = hwy::platform::Now();
+        SfpCodec::DotEO(df, sfp.get(), num, vec_eo.get(), sum0, sum1, sum2,
+                        sum3);
+        const double t1 = hwy::platform::Now();
+        elapsed_eo = HWY_MIN(elapsed_eo, t1 - t0);
+        sum0 = hn::Add(hn::Add(sum0, sum1), hn::Add(sum2, sum3));
+        actual_eo = hn::ReduceSum(df, sum0);
+      }
     }
 
     SfpCodec::Dec(d, sfp.get(), num, dec.get());
-    fprintf(stderr, "Vec %zu Dot %zu-bit %.2f MB/s\n", Lanes(d) * sizeof(T),
-            sizeof(T) * 8, num * sizeof(T) * 1E-6 / elapsed);
+    fprintf(stderr, "Vec %zu Dot %zu-bit %.2f ; %.2f MB/s\n",
+            Lanes(d) * sizeof(T), sizeof(T) * 8,
+            num * sizeof(T) * 1E-6 / elapsed,
+            num * sizeof(T) * 1E-6 / elapsed_eo);
 
     // Exact and decompressed dot products for comparison.
     float exact = 0.0f;     // using original input
     float expected = 0.0f;  // using decoded SFP
     DistortionStats dec_stats;
-    Stats ratios;
+    hwy::Stats ratios;
     for (size_t i = 0; i < num; ++i) {
       const float in1 = hwy::ConvertScalarTo<float>(in[i]);
       const float dec1 = hwy::ConvertScalarTo<float>(dec[i]);
@@ -417,24 +490,43 @@ struct TestDot {
         ratios.Notify(exact / expected);
       }
     }
+    const bool isBF = sizeof(T) == 2;
     const double dec_snr = dec_stats.GeomeanValueDivL1();
+    const double dec_wl1 = dec_stats.WeightedAverageL1();
     const double dot_snr = 1.0 / hwy::ScalarAbs(1.0 - ratios.GeometricMean());
     // exact and actual fluctuate due to the combination of SFP imprecision,
     // and whether vec[i] is negative or positive, so this is quite loose.
     const float final_ratio = HWY_MIN(exact / actual, actual / exact);
-    fprintf(stderr, "ratios %s\n", ratios.ToString().c_str());
-    fprintf(stderr,
-            "exact %.3f e2 %.4f actual %.4f final_ratio %.3f dec_snr %.2f "
-            "dot_snr %.2f\n",
-            exact, expected, actual, final_ratio, dec_snr, dot_snr);
+    if (HWY_ONCE) {
+      fprintf(stderr, "ratios %s\n", ratios.ToString().c_str());
+      fprintf(stderr,
+              "exact %.3f e2 %.4f actual %.4f final_ratio %.3f dec_snr %.2f "
+              "dot_snr %.2f dec_wl1 %.5f\n",
+              exact, expected, actual, final_ratio, dec_snr, dot_snr, dec_wl1);
+    }
     // Final values are not too far apart.
-    HWY_ASSERT(0.87f <= final_ratio && final_ratio <= 1.0f);
+    HWY_ASSERT(gcpp::IsInside(0.87f, 1.0f, final_ratio));
     // Decompressed and uncompressed dot should match exactly.
-    HWY_ASSERT(hwy::ScalarAbs(expected - actual) < 1E-4f);
-    // dec[] is close to in[], but we already check that in TestEncDec.
-    HWY_ASSERT(dec_snr >= 50.0);
+    HWY_ASSERT(gcpp::IsNear(expected, actual, 1E-4f));
+    // Even/odd dot should also match
+    HWY_ASSERT(gcpp::IsNear(actual, actual_eo, 1E-4f));
     // Geomean of ratios for each i should be very close to one.
-    HWY_ASSERT(dot_snr >= (sizeof(T) == 2 ? 70.0 : 1000.0));
+    HWY_ASSERT(dot_snr >= (isBF ? 70.0 : 1000.0));
+
+    // dec[] is close to in[]. We also check that in TestEncDec, but for much
+    // smaller input magnitudes.
+    HWY_ASSERT(gcpp::IsNear(isBF ? 51.0 : 64.0, dec_snr, 1.0));
+    HWY_ASSERT(gcpp::IsNear(isBF ? 0.013 : 0.012, dec_wl1, 0.001));
+    HWY_ASSERT(gcpp::IsNear(isBF ? 6.2 : 6.3, dec_stats.SumL1(), 0.1));
+    HWY_ASSERT_EQ(0, dec_stats.NumSignFlip());
+    HWY_ASSERT_EQ(0, dec_stats.NumRoundedToZero());
+    HWY_ASSERT_EQ(0.0, dec_stats.SumL1Rounded());
+    // Absolute decode errors are in [0, 5E-2], and somewhat right-tailed.
+    HWY_ASSERT(gcpp::IsInside(0.0f, 2E-6f, dec_stats.L1().Min()));
+    HWY_ASSERT(gcpp::IsInside(3E-2f, 5E-2f, dec_stats.L1().Max()));
+    HWY_ASSERT(gcpp::IsInside(4E-3, 7E-3, dec_stats.L1().Mean()));
+    HWY_ASSERT(gcpp::IsInside(1.8, 1.9, dec_stats.L1().Skewness()));
+    HWY_ASSERT(gcpp::IsInside(6.0, 7.0, dec_stats.L1().Kurtosis()));
   }
 };
 
@@ -456,6 +548,7 @@ HWY_AFTER_NAMESPACE();
 
 namespace gcpp {
 HWY_BEFORE_TEST(SfpTest);
+HWY_EXPORT_AND_TEST_P(SfpTest, PrintTables);
 HWY_EXPORT_AND_TEST_P(SfpTest, TestAllUnique);
 HWY_EXPORT_AND_TEST_P(SfpTest, TestAllDecEnc);
 HWY_EXPORT_AND_TEST_P(SfpTest, TestAllGolden);

@@ -18,27 +18,27 @@
 #ifndef THIRD_PARTY_GEMMA_CPP_UTIL_APP_H_
 #define THIRD_PARTY_GEMMA_CPP_UTIL_APP_H_
 
-#include <iterator>
+#include <memory>
+
+#include "hwy/contrib/thread_pool/thread_pool.h"
 #if HWY_OS_LINUX
 #include <sched.h>
-
-#include <cctype>
-#include <cerrno>  // IDE does not recognize errno.h as providing errno.
-#include <string>
 #endif  // HWY_OS_LINUX
 #include <stddef.h>
 #include <stdio.h>
 
 #include <algorithm>  // std::clamp
-#include <thread>     // NOLINT>
+#include <string>
+#include <thread>  // NOLINT>
+#include <vector>
 
-// copybara:import_next_line:gemma_cpp
-#include "configs.h"
-// copybara:import_next_line:gemma_cpp
-#include "gemma.h"
-#include "hwy/base.h"  // HWY_ASSERT
-// copybara:import_next_line:gemma_cpp
+#include "compression/io.h"  // Path
+#include "gemma/common.h"
+#include "gemma/configs.h"
+#include "gemma/gemma.h"
 #include "util/args.h"
+#include "hwy/base.h"  // HWY_ASSERT
+#include "hwy/contrib/thread_pool/topology.h"
 
 namespace gcpp {
 
@@ -49,10 +49,10 @@ static inline const char* CompiledConfig() {
     return "msan";
   } else if (HWY_IS_TSAN) {
     return "tsan";
-#if defined(HWY_IS_UBSAN)
+  } else if (HWY_IS_HWASAN) {
+    return "hwasan";
   } else if (HWY_IS_UBSAN) {
     return "ubsan";
-#endif
   } else if (HWY_IS_DEBUG_BUILD) {
     return "dbg";
   } else {
@@ -60,22 +60,60 @@ static inline const char* CompiledConfig() {
   }
 }
 
-static inline void PinThreadToCore(size_t cpu_index) {
-#if HWY_OS_LINUX
-  // Forces the thread to run on the logical processor with the same number.
-  cpu_set_t cset;             // bit array
-  CPU_ZERO(&cset);            // clear all
-  CPU_SET(cpu_index, &cset);  // set bit indicating which processor to run on.
-  const int err = sched_setaffinity(0, sizeof(cset), &cset);
-  if (err != 0) {
-    fprintf(stderr,
-            "sched_setaffinity returned %d, errno %d. Can happen if running in "
-            "a container; this warning is safe to ignore.\n",
-            err, errno);
+static inline std::vector<size_t> LpsToCpus(
+    const hwy::LogicalProcessorSet& lps) {
+  std::vector<size_t> cpus;
+  cpus.reserve(lps.Count());
+  lps.Foreach([&cpus](size_t lp) { cpus.push_back(lp); });
+  return cpus;
+}
+
+static inline std::vector<size_t> AssignCpusFromTopology(
+    const hwy::Topology& topology, const size_t num_workers) {
+  // Assign CPUs to workers 0 to num_workers - 1 based on the topology.
+  // The assignments are done in a round-robin fashion across all clusters and
+  // Cores.
+  // For example, if we have 4 clusters, the assignments will be:
+  // Thread 0 -> Cluster 0, Core 0
+  // Thread 1 -> Cluster 1, Core 0
+  // Thread 2 -> Cluster 2, Core 0
+  // Thread 3 -> Cluster 3, Core 0
+  // Thread 4 -> Cluster 0, Core 1
+  // Thread 5 -> Cluster 1, Core 1
+  // ... and so on.
+  //
+  // This would result in the least amount of sharing of the last-level
+  // cache slices. All assignments are made from Package 0.
+  std::vector<std::vector<size_t>> clusters;
+  clusters.reserve(topology.packages[0].clusters.size());
+  for (auto& cluster : topology.packages[0].clusters) {
+    clusters.push_back(LpsToCpus(cluster.lps));
   }
-#else
-  (void)cpu_index;
-#endif
+  std::vector<size_t> assigned_cpus;
+  assigned_cpus.reserve(num_workers);
+  for (size_t i = 0; i < num_workers; ++i) {
+    size_t cluster_index = i % clusters.size();
+    size_t cpu_index = (i / clusters.size()) % clusters[cluster_index].size();
+    assigned_cpus.push_back(clusters[cluster_index][cpu_index]);
+  }
+  return assigned_cpus;
+}
+
+static inline void PinWorkersToCores(hwy::ThreadPool& pool) {
+  // Use topology to pin workers to cores if available.
+  hwy::Topology topology;
+  if (!topology.packages.empty()) {
+    std::vector<size_t> assigned_cpus =
+        AssignCpusFromTopology(topology, pool.NumWorkers());
+    pool.Run(0, pool.NumWorkers(),
+             [&assigned_cpus](uint64_t /*task*/, size_t thread) {
+               hwy::PinThreadToLogicalProcessor(assigned_cpus[thread]);
+             });
+  } else {
+    pool.Run(0, pool.NumWorkers(), [](uint64_t /*task*/, size_t thread) {
+      hwy::PinThreadToLogicalProcessor(thread);
+    });
+  }
 }
 
 class AppArgs : public ArgsBase<AppArgs> {
@@ -84,8 +122,7 @@ class AppArgs : public ArgsBase<AppArgs> {
   void ChooseNumThreads() {
     if (num_threads == kDefaultNumThreads) {
       // This is a rough heuristic, replace with something better in the future.
-      num_threads = static_cast<size_t>(std::clamp(
-          static_cast<int>(std::thread::hardware_concurrency()) - 2, 1, 18));
+      num_threads = GetSupportedThreadCount();
     }
   }
 
@@ -93,6 +130,11 @@ class AppArgs : public ArgsBase<AppArgs> {
   AppArgs(int argc, char* argv[]) {
     InitAndParse(argc, argv);
     ChooseNumThreads();
+  }
+
+  static inline size_t GetSupportedThreadCount() {
+    return std::clamp(hwy::ThreadPool::MaxThreads(), size_t{1},
+                      std::min(kMaxThreads, size_t{18}));
   }
 
   Path log;  // output
@@ -110,7 +152,7 @@ class AppArgs : public ArgsBase<AppArgs> {
     visitor(num_threads, "num_threads",
             kDefaultNumThreads,  // see ChooseNumThreads
             "Number of threads to use.\n    Default = Estimate of the "
-            "number of suupported concurrent threads.",
+            "number of supported concurrent threads.",
             2);
     visitor(
         eot_line, "eot_line", std::string(""),
@@ -125,19 +167,19 @@ class AppArgs : public ArgsBase<AppArgs> {
 struct LoaderArgs : public ArgsBase<LoaderArgs> {
   LoaderArgs(int argc, char* argv[]) { InitAndParse(argc, argv); }
 
-  gcpp::Model ModelType() const { return model_type; }
-
-  gcpp::ModelTraining ModelTraining() const { return model_training; }
-
   // Returns error string or nullptr if OK.
   const char* Validate() {
-    const char* parse_result =
-        ParseModelTypeAndTraining(model_type_str, model_type, model_training);
-    if (parse_result) return parse_result;
+    if (const char* err = ParseModelTypeAndTraining(model_type_str, model_type_,
+                                                    model_training_)) {
+      return err;
+    }
+    if (const char* err = ParseType(weight_type_str, weight_type_)) {
+      return err;
+    }
     if (tokenizer.path.empty()) {
       return "Missing --tokenizer flag, a file for the tokenizer is required.";
     }
-    if (!tokenizer.exists()) {
+    if (!tokenizer.Exists()) {
       return "Can't open file specified with --tokenizer flag.";
     }
     if (!compressed_weights.path.empty()) {
@@ -152,7 +194,7 @@ struct LoaderArgs : public ArgsBase<LoaderArgs> {
     if (weights.path.empty()) {
       return "Missing --weights flag, a file for the model weights.";
     }
-    if (!weights.exists()) {
+    if (!weights.Exists()) {
       return "Can't open file specified with --weights flag.";
     }
     return nullptr;
@@ -162,8 +204,7 @@ struct LoaderArgs : public ArgsBase<LoaderArgs> {
   Path weights;  // weights file location
   Path compressed_weights;
   std::string model_type_str;
-  Model model_type;
-  enum ModelTraining model_training;
+  std::string weight_type_str;
 
   template <class Visitor>
   void ForEach(const Visitor& visitor) {
@@ -180,8 +221,33 @@ struct LoaderArgs : public ArgsBase<LoaderArgs> {
             "gr2b-it = griffin 2B parameters, instruction-tuned\n    "
             "gr2b-pt = griffin 2B parameters, pretrained\n    "
             "    Required argument.");
+    visitor(weight_type_str, "weight_type", std::string("sfp"),
+            "Weight type\n    f32 = float, bf16 = bfloat16, SFP = 8-bit FP\n"
+            "    Required argument.");
   }
+
+  // Uninitialized before Validate, must call after that.
+  gcpp::Model ModelType() const { return model_type_; }
+  gcpp::ModelTraining ModelTrainingType() const { return model_training_; }
+  gcpp::Type WeightType() const { return weight_type_; }
+
+ private:
+  Model model_type_;
+  ModelTraining model_training_;
+  Type weight_type_;
 };
+
+static inline Gemma CreateGemma(const LoaderArgs& loader,
+                                hwy::ThreadPool& pool) {
+  return Gemma(loader.tokenizer, loader.weights, loader.ModelType(),
+               loader.WeightType(), pool);
+}
+
+static inline std::unique_ptr<Gemma> AllocateGemma(const LoaderArgs& loader,
+                                                   hwy::ThreadPool& pool) {
+  return std::make_unique<Gemma>(loader.tokenizer, loader.weights,
+                                 loader.ModelType(), loader.WeightType(), pool);
+}
 
 struct InferenceArgs : public ArgsBase<InferenceArgs> {
   InferenceArgs(int argc, char* argv[]) { InitAndParse(argc, argv); }

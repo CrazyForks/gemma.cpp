@@ -83,23 +83,34 @@ A `.clang-format` configuration is provided with our defaults, please run source
 files through `clang-format` (or a formatter that produces equivalent behavior)
 before finalizing PR for submission.
 
+## Converting weights
+
+We use a stripped down binary blob (.sbs) artifact to accelerate weight loading
+in C++. These files can be downloaded directly from Kaggle and HuggingFace. You
+can also convert Pytorch or Keras checkpoints to .sbs, but most end users should
+not have to do this.
+
+If starting with Keras, first run this script to convert to Pytorch:
+https://github.com/keras-team/keras-nlp/blob/master/tools/gemma/export_gemma_to_torch_xla.py
+
+From Pytorch, use the following script to generate uncompressed weights:
+https://github.com/google/gemma.cpp/blob/dev/util/convert_weights.py
+
+Then run gemma/compress_weights.cc (Bazel target :compress_weights), specifying
+the resulting file as `--weights` and the desired .sbs name as the
+`--compressed_weights`.
+
 ## Compile-Time Flags (Advanced)
 
 There are several compile-time flags to be aware of (note these may or may not
 be exposed to the build system):
 
-- `GEMMA_WEIGHT_T` : Sets the level of compression for weights (surfaced as
-  WEIGHT_TYPE in CMakeLists.txt). Currently this should be set to `SfpStream`
-  (default, if no flag is specified) for 8-bit SFP, or `hwy::bfloat16_t` to
-  enable for higher-fidelity (but slower) bfloat16 support. This is defined in
-  `gemma.h`.
 - `GEMMA_MAX_SEQ_LEN` : Sets maximum sequence length to preallocate for the KV
   Cache. The default is 4096 tokens but can be overridden. This is not exposed
   through `CMakeLists.txt` yet.
 
-In the medium term both of these will likely be deprecated in favor of handling
-options at runtime - allowing for multiple weight compression schemes in a single
-build and dynamically resizes the KV cache as needed.
+In the medium term this will likely be deprecated in favor of handling options
+at runtime - dynamically resizing the KV cache as needed.
 
 ## Using gemma.cpp as a Library (Advanced)
 
@@ -109,16 +120,16 @@ the library.
 
 You can regard `run.cc` as an example application that your own application is
 substituting for, so the invocations into gemma.h and gemma.cc you see in
-`run.cc` are probably the functions you'll be invoking. You can find examples
-of the invocations to tokenizer methods and `GenerateGemma` in `run.cc`.
+`run.cc` are probably the functions you'll be invoking. You can find examples of
+the invocations to tokenizer methods and `Generate()` in `run.cc`.
 
 Keep in mind gemma.cpp is oriented at more experimental / prototype / research
 applications. If you're targeting production, there's more standard paths via
-jax / pytorch / keras for NN deployments.
+jax / pytorch / keras / XNNPACK for NN deployments.
 
 ### Gemma struct contains all the state of the inference engine - tokenizer, weights, and activations
 
-`Gemma(...)` - constructor, creates a gemma model object. 
+`Gemma(...)` - constructor, creates a gemma model object.
 
 In a standard LLM chat app, you'll probably use a Gemma object directly, in
 more exotic data processing or research applications, you might decompose
@@ -132,32 +143,37 @@ The Gemma object contains contains a pointer to a Tokenizer object. The main
 operations performed on the tokenizer are to load the tokenizer model from a
 file (usually `tokenizer.spm`), call `Encode()` to go from string prompts to
 token id vectors, or `Decode()` to go from token id vector outputs from the
-model back to strings.
+model back to strings. `benchmark_helper.h` provides wrapper functions that make
+them easier to use.
 
-### `GenerateGemma()` is the entrypoint for token generation
+### `model.Generate()` is the entrypoint for token generation
 
-Calling into `GenerateGemma` with a tokenized prompt will 1) mutate the
-activation values in `model` and 2) invoke StreamFunc - a lambda callback for
-each generated token.
+Calling into `model.Generate` with a tokenized prompt will
 
-Your application defines its own StreamFunc as a lambda callback to do
-something everytime a token string is streamed from the engine (eg print to the
-screen, write data to the disk, send the string to a server, etc.). You can see
-in `run.cc` the StreamFunc lambda takes care of printing each token to the
+1.  mutate the activation values in `model` and
+2.  invoke `StreamFunc` - a lambda callback for each generated token.
+
+Your application defines its own `StreamFunc` as a lambda callback to do
+something every time a token string is streamed from the engine (e.g., print to
+the screen, write data to the disk, send the string to a server, etc.). You can
+see in `run.cc` the `StreamFunc` lambda takes care of printing each token to the
 screen as it arrives.
 
-Optionally you can define accept_token as another lambda - this is mostly for
-constrained decoding type of use cases where you want to force the generation
-to fit a grammar. If you're not doing this, you can send an empty lambda as a
-no-op which is what `run.cc` does.
+Optionally you can define `accept_token` as another lambda - this is mostly for
+constrained decoding type of use cases where you want to force the generation to
+fit a grammar. If you're not doing this, you can send an empty lambda or
+`std::function` as a no-op which is what `run.cc` does.
 
 ### `Transformer()` implements the inference (i.e. `forward()` method in PyTorch or Jax) computation of the neural network
 
-For high-level applications, you might only call `GenerateGemma()` and never
+For high-level applications, you might only call `model.Generate()` and never
 interact directly with the neural network, but if you're doing something a bit
-more custom you can call transformer which performs a single inference
-operation on a single token and mutates the Activations and the KVCache through
-the neural network computation.
+more custom you can call transformer which performs a single inference operation
+on a single token and mutates the Activations and the KVCache through the neural
+network computation.
+
+Note that an experimental backward pass is available in backprop/, which may be
+useful for fine tuning.
 
 ### For low level operations, defining new architectures, call `ops.h` functions directly
 
@@ -169,9 +185,17 @@ inference path of the Gemma model.
 The sentencepiece library we depend on requires some additional work to build
 with the Bazel build system. First, it does not export its BUILD file, so we
 provide `bazel/sentencepiece.bazel`. Second, it ships with a vendored subset of
-the Abseil library. `bazel/com_google_sentencepiece.patch` changes the code to
-support Abseil as a standalone dependency without third_party/ prefixes, similar
-to the transforms we apply to Gemma via Copybara.
+the Abseil library. `bazel/sentencepiece.patch` changes the code to support
+Abseil as a standalone dependency without third_party/ prefixes, similar to the
+transforms we apply to Gemma via Copybara.
+
+## Debugging
+
+At the first sign of incorrect or unexpected results, we recommend running with
+ASan/MSan enabled. When using blaze/bazel, you can add `--config=asan` or
+`--config=msan-track-origins` to the build command. In addition to their checks
+for memory overruns or uninitialized memory, we also enable debug-only asserts
+in Gemma.cpp for those build configurations.
 
 ## Discord
 

@@ -20,9 +20,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-// copybara:import_next_line:gemma_cpp
 #include "compression/nuq.h"
-// copybara:import_next_line:gemma_cpp
 #include "compression/sfp.h"
 #include "hwy/base.h"
 
@@ -37,7 +35,6 @@
 #define THIRD_PARTY_GEMMA_CPP_COMPRESSION_NUQ_INL_TOGGLE
 #endif
 
-// copybara:import_next_line:gemma_cpp
 #include "compression/sfp-inl.h"
 #include "hwy/contrib/sort/vqsort-inl.h"
 #include "hwy/highway.h"
@@ -107,9 +104,8 @@ class NuqClustering {
       // Callers are responsible for ignoring lanes where last < first.
       HWY_DASSERT(first < kGroupSize);
       HWY_DASSERT(last < kGroupSize);
-      const size_t len = last - first + 1;
-      const hn::Vec<DF> vlen =
-          hn::Iota(df, static_cast<float>(static_cast<int>(len)));
+      const int len = static_cast<int>(last) - static_cast<int>(first) + 1;
+      const hn::Vec<DF> vlen = hn::Iota(df, static_cast<float>(len));
 
       const hn::Vec<DF> u_lo = hn::Set(df, cumsum_[first]);
       const hn::Vec<DF> u_lo2 = hn::Set(df, cumsum2_[first]);
@@ -207,11 +203,11 @@ class NuqClustering {
     for (size_t num_clusters = 1; num_clusters < kClusters; ++num_clusters) {
       // For each batch starting at `last`, one per lane:
       for (size_t last = 0; last < kGroupSize; last += N) {
-        VF min = cc(df, 0, last);
+        VF min = hn::LoadU(df, &D(0, last));
         VI arg = hn::Zero(di);
         // For each j (start of rightmost cluster):
         VI vj = k1;
-        for (size_t j = 1; j < last + N; ++j, vj = Add(vj, k1)) {
+        for (size_t j = 1; j < last + N; ++j, vj = hn::Add(vj, k1)) {
           const VF c = ClusterDynProg(df, D, cc, num_clusters, last, j);
 
           // Retain the min cost and the j index that caused it.

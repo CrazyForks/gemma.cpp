@@ -138,30 +138,16 @@ convenient directory location (e.g. the `build/` directory in this repo).
 The build system uses [CMake](https://cmake.org/). To build the gemma inference
 runtime, create a build directory and generate the build files using `cmake`
 from the top-level project directory. Note if you previous ran `cmake` and are
-re-running with a different setting, be sure to clean out the `build/` directory
-with `rm -rf build/*` (warning this will delete any other files in the `build/`
-directory.
-
-For the 8-bit switched floating point weights (sfp), run cmake with no options:
+re-running with a different setting, be sure to delete all files in the `build/`
+directory with `rm -rf build/*`.
 
 #### Unix-like Platforms
 ```sh
 cmake -B build
 ```
 
-**or** if you downloaded bfloat16 weights (any model *without* `-sfp` in the name),
-instead of running cmake with no options as above, run cmake with WEIGHT_TYPE
-set to [highway's](https://github.com/google/highway) `hwy::bfloat16_t` type
-(this will be simplified in the future, we recommend using `-sfp` weights
-instead of bfloat16 for faster inference):
-
-```sh
-cmake -B build -DWEIGHT_TYPE=hwy::bfloat16_t
-```
-
-After running whichever of the above `cmake` invocations that is appropriate for
-your weights, you can enter the `build/` directory and run `make` to build the
-`./gemma` executable:
+After running `cmake`, you can enter the `build/` directory and run `make` to
+build the `./gemma` executable:
 
 ```sh
 # Configure `build` directory
@@ -206,25 +192,32 @@ bazel build -c opt --cxxopt=-std=c++20 :gemma
 
 If the build is successful, you should now have a `gemma` executable in the `bazel-bin/` directory.
 
+#### Make
+
+If you prefer Makefiles, @jart has made one available here:
+
+https://github.com/jart/gemma3/blob/main/Makefile
+
 ### Step 4: Run
 
 You can now run `gemma` from inside the `build/` directory.
 
 `gemma` has the following required arguments:
 
-| Argument | Description | Example value |
-| -------- | ----------- | ------------- |
-| `--model` | The model type. | `2b-it`, `2b-pt`, `7b-it`, `7b-pt`, ... (see above) |
-| `--compressed_weights` | The compressed weights file. | `2b-it-sfp.sbs`, ... (see above) |
-| `--tokenizer` | The tokenizer file. | `tokenizer.spm` |
-
+Argument        | Description                  | Example value
+--------------- | ---------------------------- | -----------------------
+`--model`       | The model type.              | `2b-it` ... (see below)
+`--weights`     | The compressed weights file. | `2b-it-sfp.sbs`
+`--weight_type` | The compressed weight type.  | `sfp`
+`--tokenizer`   | The tokenizer file.          | `tokenizer.spm`
 
 `gemma` is invoked as:
 
 ```sh
 ./gemma \
 --tokenizer [tokenizer file] \
---compressed_weights [compressed weights file] \
+--weights [compressed weights file] \
+--weight_type [f32 or bf16 or sfp] \
 --model [2b-it or 2b-pt or 7b-it or 7b-pt or ...]
 ```
 
@@ -237,8 +230,7 @@ Example invocation for the following configuration:
 ```sh
 ./gemma \
 --tokenizer tokenizer.spm \
---compressed_weights 2b-it-sfp.sbs \
---model 2b-it
+--weights 2b-it-sfp.sbs --weight_type sfp --model 2b-it
 ```
 
 ### RecurrentGemma
@@ -252,25 +244,22 @@ here provide a C++ implementation of this model based on the paper.
 
 To use the recurrent version of Gemma included in this repository, build the
 gemma binary as noted above in Step 3. Download the compressed weights and
-tokenizer from
+tokenizer from the RecurrentGemma
 [Kaggle](https://www.kaggle.com/models/google/recurrentgemma/gemmaCpp) as in
 Step 1, and run the binary as follows:
 
-`./gemma --tokenizer tokenizer.spm --model gr2b-it --compressed_weights 2b-it-sfp.sbs`
-
+`./gemma --tokenizer tokenizer.spm --model gr2b-it --weights 2b-it-sfp.sbs`
 
 ### Troubleshooting and FAQs
 
 **Running `./gemma` fails with "Failed to read cache gating_ein_0 (error 294) ..."**
 
-The most common problem is that `cmake` was built with the wrong weight type and
-`gemma` is attempting to load `bfloat16` weights (`2b-it`, `2b-pt`, `7b-it`,
-`7b-pt`) using the default switched floating point (sfp) or vice versa. Revisit
-step #3 and check that the `cmake` command used to build `gemma` was correct for
-the weights that you downloaded.
+The most common problem is that the `--weight_type` argument does not match that
+of the model file. Revisit step #3 and check which weights you downloaded.
 
-In the future we will handle model format handling from compile time to runtime
-to simplify this.
+Note that we have already moved weight type from a compile-time decision to a
+runtime argument. In a subsequent step, we plan to bake this information into
+the weights.
 
 **Problems building in Windows / Visual Studio**
 
@@ -376,7 +365,7 @@ For using the `gemma` executable as a command line tool, it may be useful to
 create an alias for gemma.cpp with arguments fully specified:
 
 ```sh
-alias gemma2b="~/gemma.cpp/build/gemma -- --tokenizer ~/gemma.cpp/build/tokenizer.spm --compressed_weights ~/gemma.cpp/build/2b-it-sfp.sbs --model 2b-it --verbosity 0"
+alias gemma2b="~/gemma.cpp/build/gemma -- --tokenizer ~/gemma.cpp/build/tokenizer.spm --weights ~/gemma.cpp/build/2b-it-sfp.sbs --model 2b-it --verbosity 0"
 ```
 
 Replace the above paths with your own paths to the model and tokenizer paths

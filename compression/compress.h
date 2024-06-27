@@ -27,20 +27,16 @@
 #include <vector>
 
 // IWYU pragma: begin_exports
-// copybara:import_next_line:gemma_cpp
 #include "compression/blob_store.h"
-// copybara:import_next_line:gemma_cpp
+#include "compression/io.h"
 #include "compression/nuq.h"
-// copybara:import_next_line:gemma_cpp
 #include "compression/sfp.h"
 // IWYU pragma: end_exports
-// copybara:import_next_line:gemma_cpp
 #include "compression/distortion.h"
 #include "hwy/base.h"  // hwy::bfloat16_t
 #include "hwy/contrib/thread_pool/thread_pool.h"
 #if COMPRESS_STATS
-// copybara:import_next_line:gemma_cpp
-#include "compression/stats.h"
+#include "hwy/stats.h"
 #endif
 
 namespace gcpp {
@@ -61,6 +57,13 @@ constexpr size_t CompressedArrayLen<NuqStream>(size_t capacity) {
 }
 }  // namespace detail
 
+// Returns the number of bytes required to store a compressed array with the
+// given type and capacity.
+template <typename MatT>
+constexpr size_t CompressedArraySize(size_t capacity) {
+  return detail::CompressedArrayLen<MatT>(capacity) * sizeof(MatT);
+}
+
 // Compressed representation of floating-point elements. The array length may
 // differ from the number of elements. Associated operations such as Dot are
 // implemented in SIMD code and are thus non-member functions.
@@ -76,6 +79,9 @@ class CompressedArray {
   MatT* data() { return data_.data(); }
   const MatT* data() const { return data_.data(); }
 
+  // Decoded elements should be multiplied by this to restore their original
+  // range. This is required because SfpStream can only encode a limited range
+  // of magnitudes.
   float scale() const { return scale_[0]; }
   void set_scale(float scale) { scale_[0] = scale; }
 
@@ -87,6 +93,7 @@ class CompressedArray {
 
  private:
   std::array<MatT, NumCompressed()> data_;
+  // Blobs are at least kBlobAlign bytes anyway.
   float scale_[kBlobAlign / sizeof(float)];
 };
 
@@ -114,7 +121,7 @@ class CompressStats {
   }
 
   void PrintAll() {
-    const int skip = Stats::kNoGeomean;
+    const int skip = hwy::Stats::kNoGeomean;
     fprintf(stderr, "  pnorm %s\n", s_pnorm_.ToString(skip).c_str());
     fprintf(stderr, "   SNR  %s\n", s_snr_.ToString(skip).c_str());
     fprintf(stderr, "  #exact %.3E\n", static_cast<double>(num_exact_));
@@ -129,10 +136,10 @@ class CompressStats {
   }
 
  private:
-  Stats s_pnorm_;
-  Stats s_snr_;
+  hwy::Stats s_pnorm_;
+  hwy::Stats s_snr_;
   size_t num_exact_ = 0;
-  Bins<1000> hist_weights_;
+  hwy::Bins<1000> hist_weights_;
   char padding_[64];  // prevent false sharing
 };
 #else
@@ -169,15 +176,17 @@ hwy::uint128_t CacheKey(const char* name) {
   return MakeKey((std::string(1, prefix) + name).c_str());
 }
 
+// Functor called for each tensor, which loads them and their scaling factors
+// from BlobStore.
 class CacheLoader {
  public:
-  explicit CacheLoader(const char* blob_filename) {
+  explicit CacheLoader(const Path& blob_filename) {
     err_ = reader_.Open(blob_filename);
     if (err_ != 0) {
       fprintf(stderr,
               "Cached compressed weights does not exist yet (code %d), "
               "compressing weights and creating file: %s.\n",
-              err_, blob_filename);
+              err_, blob_filename.path.c_str());
     }
   }
 
